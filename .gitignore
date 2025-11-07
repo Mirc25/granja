@@ -1,0 +1,19 @@
+# Python & cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Virtual env
+venv/
+
+# Playwright/Chrome user data
+chrome_profile/
+
+# Generated artifacts and temp files
+artifacts/
+tmp_*.html
+
+# OS junk
+Thumbs.db
+.DS_Store
