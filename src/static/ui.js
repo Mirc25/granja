@@ -42,6 +42,7 @@ document.addEventListener('DOMContentLoaded', function() {
       var rotateVpn = document.getElementById('rotate_vpn').checked;
       var vpnProvider = document.getElementById('vpn_provider').value || '';
       var vpnCountry = document.getElementById('vpn_country').value || '';
+      if (vpnProvider === 'none') { vpnProvider = ''; vpnCountry = ''; }
       var vpnWait = document.getElementById('vpn_wait').value || '5000';
 
       var urlsRepeated = buildRepeated(urls.trim(), reps);
@@ -97,6 +98,7 @@ document.addEventListener('DOMContentLoaded', function() {
       var rotateVpn = document.getElementById('rotate_vpn').checked;
       var vpnProvider = document.getElementById('vpn_provider').value || '';
       var vpnCountry = document.getElementById('vpn_country').value || '';
+      if (vpnProvider === 'none') { vpnProvider = ''; vpnCountry = ''; }
       var vpnWait = document.getElementById('vpn_wait').value || '5000';
       var instancesEl = document.getElementById('instances');
       var instCount = instancesEl ? parseInt(instancesEl.value || '1', 10) : 1;
@@ -244,9 +246,73 @@ function ensureLivePreviewTimer(){
       var ts = Date.now();
       imgs.forEach(function(img){
         var base = img.getAttribute('data-src-base') || (img.src ? img.src.split('?')[0] : '');
-        if (base) {
-          img.setAttribute('data-src-base', base);
-          img.src = base + '?ts=' + ts;
+        if (!base) return;
+        img.setAttribute('data-src-base', base);
+        var ready = img.getAttribute('data-ready');
+        var loading = img.getAttribute('data-loading') === '1';
+        var last = parseInt(img.getAttribute('data-last') || '0', 10);
+        if (ready === '1') {
+          // Ya existe: comprobar cambios con HEAD y precargar antes de conmutar
+          if (loading) return;
+          if ((ts - last) < 900) return; // throttle ~1s
+          try {
+            fetch(base, { method: 'HEAD', cache: 'no-store' })
+              .then(function(resp){
+                if (!resp || !resp.ok) return;
+                var lm = resp.headers.get('last-modified') || '';
+                var et = resp.headers.get('etag') || '';
+                var sz = resp.headers.get('content-length') || '';
+                var prevLm = img.getAttribute('data-lm') || '';
+                var prevEt = img.getAttribute('data-etag') || '';
+                var prevSz = img.getAttribute('data-size') || '';
+                var changed = (lm && lm !== prevLm) || (et && et !== prevEt) || (sz && sz !== prevSz);
+                if (!changed) { img.setAttribute('data-last', String(Date.now())); return; }
+                img.setAttribute('data-loading', '1');
+                var url = base + '?ts=' + Date.now();
+                var probe2 = new Image();
+                probe2.onload = function(){
+                  img.src = url; // conmutar solo cuando la nueva imagen está cargada
+                  img.setAttribute('data-loading', '0');
+                  img.setAttribute('data-last', String(Date.now()));
+                  if (lm) img.setAttribute('data-lm', lm);
+                  if (et) img.setAttribute('data-etag', et);
+                  if (sz) img.setAttribute('data-size', sz);
+                };
+                probe2.onerror = function(){ img.setAttribute('data-loading', '0'); };
+                probe2.referrerPolicy = 'no-referrer';
+                probe2.src = url;
+              })
+              .catch(function(){ /* ignorar */ });
+          } catch(e) { /* ignorar */ }
+        } else {
+          // Aún con placeholder: comprobar existencia y precargar antes de conmutar
+          if (loading) return;
+          try {
+            fetch(base + '?ts=' + ts, { method: 'HEAD', cache: 'no-store' })
+              .then(function(resp){
+                if (resp && resp.ok) {
+                  img.setAttribute('data-loading', '1');
+                  var url = base + '?ts=' + Date.now();
+                  var probe = new Image();
+                  probe.onload = function(){
+                    img.setAttribute('data-ready', '1');
+                    img.setAttribute('data-loading', '0');
+                    img.setAttribute('data-last', String(Date.now()));
+                    var lm = resp.headers.get('last-modified') || '';
+                    var et = resp.headers.get('etag') || '';
+                    var sz = resp.headers.get('content-length') || '';
+                    if (lm) img.setAttribute('data-lm', lm);
+                    if (et) img.setAttribute('data-etag', et);
+                    if (sz) img.setAttribute('data-size', sz);
+                    img.src = url;
+                  };
+                  probe.onerror = function(){ img.setAttribute('data-loading', '0'); };
+                  probe.referrerPolicy = 'no-referrer';
+                  probe.src = url;
+                }
+              })
+              .catch(function(){ /* ignorar */ });
+          } catch(e) { /* ignorar */ }
         }
       });
     } catch(e){}

@@ -344,16 +344,20 @@ def get_result(job_id: str):
     ),
 )
 def run_browser(req: EnqueueBrowserRequest):
+    # Usar argumentos nombrados para evitar desalineaciones y activar referente simulado en YouTube
+    urls_list = [str(u) for u in req.urls]
+    sim_ref = any(("youtube.com" in u) or ("youtu.be" in u) for u in urls_list)
     result = visit_links_with_rotation(
-        [str(u) for u in req.urls],
-        req.max_pages_per_proxy,
-        req.screenshot,
-        req.user_agent,
-        req.headless,
-        req.respect_robots,
-        req.min_dwell_ms,
-        req.max_dwell_ms,
-        req.actions,
+        urls=urls_list,
+        max_pages_per_proxy=req.max_pages_per_proxy,
+        screenshot=req.screenshot,
+        user_agent=req.user_agent,
+        headless=req.headless,
+        respect_robots=req.respect_robots,
+        min_dwell_ms=req.min_dwell_ms,
+        max_dwell_ms=req.max_dwell_ms,
+        actions=req.actions,
+        simulate_referrer_search=sim_ref,
     )
     return JSONResponse(result)
 
@@ -499,6 +503,7 @@ def run_browser_form(
         min_dwell_ms=min_dwell_ms,
         max_dwell_ms=max_dwell_ms,
         actions=actions,
+        simulate_referrer_search=(bool(play_video) or any(("youtube.com" in u) or ("youtu.be" in u) for u in urls)),
         rotate_vpn_per_url=bool(rotate_vpn_per_url),
         vpn_provider=vpn_provider,
         vpn_country=vpn_country,
@@ -691,6 +696,7 @@ def run_browser_silent_form(
         min_dwell_ms=min_dwell_ms,
         max_dwell_ms=max_dwell_ms,
         actions=actions,
+        simulate_referrer_search=(bool(play_video) or any(("youtube.com" in u) or ("youtu.be" in u) for u in urls)),
         rotate_vpn_per_url=bool(rotate_vpn_per_url),
         vpn_provider=vpn_provider,
         vpn_country=vpn_country,
@@ -868,6 +874,7 @@ def run_browser_silent_inline(
         min_dwell_ms=min_dwell_ms,
         max_dwell_ms=max_dwell_ms,
         actions=actions,
+        simulate_referrer_search=(bool(play_video) or any(("youtube.com" in u) or ("youtu.be" in u) for u in urls)),
         rotate_vpn_per_url=bool(rotate_vpn_per_url),
         vpn_provider=vpn_provider,
         vpn_country=vpn_country,
@@ -1391,6 +1398,60 @@ def run_browser_headful_grid_live(
                         played_ok = bool(page.evaluate("() => { const v = document.querySelector('video'); if (!v) return false; try { return !v.paused || v.currentTime > 1; } catch(e){ return false; } }"))
                     except Exception:
                         pass
+
+                    # Fallback automático: si aparece el error 153 o no reproduce, abrir en modo watch
+                    try:
+                        is_err153 = False
+                        try:
+                            is_err153 = bool(page.evaluate("() => { const txt = document.body ? (document.body.innerText||'') : ''; return txt.includes('153'); }"))
+                        except Exception:
+                            is_err153 = False
+
+                        if (not played_ok) or is_err153:
+                            href = None
+                            # 1) Intentar encontrar enlace explícito "Mirar en YouTube"
+                            try:
+                                href = page.evaluate(
+                                    "() => { const texts=['Mirar el video en YouTube','Ver en YouTube','Watch on YouTube']; const links=Array.from(document.querySelectorAll('a')); for (const a of links){ const t=(a.textContent||'').trim().toLowerCase(); if (texts.some(x=>t.includes(x.toLowerCase()))){ if (a.href) return a.href; } } for (const a of links){ const h=a.href||''; if (h.includes('youtube.com/watch')||h.includes('youtu.be/')) return h; } return null; }"
+                                )
+                            except Exception:
+                                href = None
+                            # 2) Si no hay enlace, convertir embed/param v= a watch
+                            if not href:
+                                try:
+                                    import re as _re
+                                    curr = page.url or ""
+                                    m = _re.search(r"[?&]v=([A-Za-z0-9_-]{6,})", curr)
+                                    vid = m.group(1) if m else None
+                                    if not vid and "/embed/" in curr:
+                                        m2 = _re.search(r"/embed/([A-Za-z0-9_-]{6,})", curr)
+                                        vid = m2.group(1) if m2 else None
+                                    if vid:
+                                        href = f"https://www.youtube.com/watch?v={vid}"
+                                except Exception:
+                                    pass
+                            # 3) Navegar y reproducir
+                            if href:
+                                try:
+                                    page.goto(href, wait_until="domcontentloaded")
+                                    page.wait_for_timeout(800)
+                                except Exception:
+                                    pass
+                                try:
+                                    page.locator('.ytp-large-play-button, .ytp-play-button').first.click(timeout=1500)
+                                except Exception:
+                                    pass
+                                try:
+                                    page.evaluate("() => { const v = document.querySelector('video'); if (v) { try { v.muted = true; } catch(e){} try { v.play(); } catch(e){} } }")
+                                except Exception:
+                                    pass
+                                page.wait_for_timeout(1200)
+                                try:
+                                    played_ok = bool(page.evaluate("() => { const v = document.querySelector('video'); if (!v) return false; try { return !v.paused || v.currentTime > 1; } catch(e){ return false; } }"))
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 # Capturar screenshots periÃ³dicas
@@ -1429,11 +1490,10 @@ def run_browser_headful_grid_live(
     minis = []
     for i in range(instances):
         img_src = f"/artifacts/{counter_id}_{i}.png"
-        done_src = f"/artifacts/{counter_id}_{i}.done"
         minis.append(
             f'<div class="mini warn" data-counter-id="{counter_id}" data-index="{i}">' 
             f'<a href="{img_src}" target="_blank" title="ver captura">' 
-            f'<img class="mini-live" data-src-base="{img_src}" src="{img_src}" style="width:160px;height:90px;border:1px solid #333;border-radius:6px;object-fit:cover;background:#0f1115;" alt="vista previa" />' 
+            f'<img class="mini-live" data-src-base="{img_src}" data-ready="0" src="/static/placeholder.svg" style="width:160px;height:90px;border:1px solid #333;border-radius:6px;object-fit:cover;background:#0f1115;" alt="vista previa" />' 
             f'</a>' 
             f'<span class="badge">Ejecutando</span>' 
             f'</div>'
@@ -2118,15 +2178,15 @@ def ui():
       </div>
       <div>
         <label>Rotar VPN por URL:</label><br />
-        <input id=\"rotate_vpn\" type=\"checkbox\" checked />
+        <input id=\"rotate_vpn\" type=\"checkbox\" />
       </div>
       <div>
         <label>Proveedor VPN:</label><br />
-        <select id=\"vpn_provider\">\n          <option value=\"nordvpn\" selected>NordVPN</option>\n        </select>
+        <select id=\"vpn_provider\">\n          <option value=\"none\" selected>— Sin VPN —</option>\n          <option value=\"nordvpn\">NordVPN</option>\n        </select>
       </div>
       <div>
         <label>PaÃ­s VPN:</label><br />
-        <input id=\"vpn_country\" type=\"text\" placeholder=\"Argentina\" value=\"Argentina\" />
+        <input id=\"vpn_country\" type=\"text\" placeholder=\"Argentina\" value=\"\" />
       </div>
       <div>
         <label>Espera tras conectar VPN (ms):</label><br />

@@ -3,6 +3,7 @@ import os
 import time
 import random
 import subprocess
+import urllib.parse
 
 from playwright.sync_api import sync_playwright
 from .config import artifacts_dir, default_user_agent
@@ -10,6 +11,49 @@ from .proxies import ProxyRotator
 from .robots_util import is_allowed_by_robots
 from .vpn import get_vpn_controller
 
+
+# Listas de User Agents más diversas para rotar la huella digital
+MOBILE_USER_AGENTS = [
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 12; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 11; M2011K2G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 10; SM-A505F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; 2201116SG) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",  # Xiaomi
+]
+
+DESKTOP_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+]
+
+def generate_human_mouse_movement(page, steps: int = 5):
+    """Mueve el mouse de forma aleatoria y lenta para simular comportamiento humano."""
+    try:
+        vp = page.viewport_size
+        if not vp:
+            # Fallback a un tamaño estándar si no está disponible (ejecución sin headless)
+            vp = {"width": 1024, "height": 768}
+
+        # Mover a una posición inicial aleatoria
+        x_start = random.randint(50, vp["width"] - 50)
+        y_start = random.randint(50, vp["height"] - 50)
+        page.mouse.move(x_start, y_start)
+
+        # Mover en pasos aleatorios y lentos
+        for _ in range(steps):
+            x_end = random.randint(50, vp["width"] - 50)
+            y_end = random.randint(50, vp["height"] - 50)
+            # steps=5 a 15 simula movimiento lento y no instantáneo
+            page.mouse.move(x_end, y_end, steps=random.randint(5, 15))
+            time.sleep(random.uniform(0.1, 0.5))
+
+        # Dejar el mouse en una posición neutral
+        page.mouse.move(vp["width"] // 2, vp["height"] // 2, steps=20)
+    except Exception:
+        # Ignorar errores de simulación de mouse
+        pass
 
 def ensure_artifacts_dir():
     os.makedirs(artifacts_dir, exist_ok=True)
@@ -91,13 +135,23 @@ def visit_links_with_rotation(
     vpn_country: Optional[str] = None,
     vpn_servers: Optional[List[str]] = None,
     vpn_wait_ms: int = 5000,
+    simulate_referrer_search: bool = False,
 ) -> Dict:
     """
-    Visita una lista de URLs con Playwright, rotando proxies tras N páginas.
-    Opcionalmente respeta robots.txt. Permite acciones simples (click, type, wait_for, js, play_video).
-    Devuelve resultados por URL.
+    Visita una lista de URLs con Playwright aplicando medidas anti-detección:
+    - Rotación de User-Agent (móvil y escritorio) si se solicita.
+    - Navegación vía Google como referer antes de una URL de YouTube.
+    - Permanencia simulada con movimientos de mouse y scrolls humanos.
     """
-    ua = user_agent or default_user_agent
+    # 1) Selección de User-Agent
+    ua = user_agent
+    current_profile_name = None
+    if rotate_android_profiles:
+        all_uas = MOBILE_USER_AGENTS + DESKTOP_USER_AGENTS
+        ua = random.choice(all_uas)
+        current_profile_name = "Rotated_Profile"
+    elif not ua:
+        ua = default_user_agent
     ensure_artifacts_dir()
 
     rotator = ProxyRotator()
@@ -105,11 +159,11 @@ def visit_links_with_rotation(
     pages_on_current_proxy = 0
     results = []
 
-    # Conjunto de perfiles Android para simular dispositivos diferentes
+    # Perfiles Android para viewport/locale consistentes
     android_profiles = [
         {
             "name": "Pixel 5 (Android 11)",
-            "user_agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+            "user_agent": MOBILE_USER_AGENTS[0],
             "viewport": {"width": 393, "height": 851},
             "is_mobile": True,
             "has_touch": True,
@@ -162,13 +216,12 @@ def visit_links_with_rotation(
         browser_type = p.chromium
 
         def new_browser_and_context():
-            # Intentar abrir con bandera de incógnito visible si se solicita y hay UI
             launch_kwargs: Dict = {"headless": headless}
             if current_proxy:
                 launch_kwargs["proxy"] = current_proxy
-            # Determina opciones de contexto según perfil
-            context_opts: Dict = {"user_agent": ua}
-            current_profile = None
+            # Permitir reproducción de video sin gesto del usuario
+            launch_kwargs["args"] = ["--autoplay-policy=no-user-gesture-required"]
+            context_opts: Dict = {"user_agent": ua, "locale": "es-ES"}
             if rotate_android_profiles and android_profiles:
                 current_profile = android_profiles[profile_index % len(android_profiles)]
                 context_opts.update({
@@ -180,29 +233,7 @@ def visit_links_with_rotation(
                     "locale": current_profile["locale"],
                     "timezone_id": current_profile["timezone_id"],
                 })
-            if not headless and force_incognito:
-                # Lanzar incognito con mejores fallbacks: Chrome channel -> Chrome exe -> Edge InPrivate -> Chromium
-                args_incog = ["--incognito", "--new-window", "--no-first-run", "--no-default-browser-check"]
-                try:
-                    browser = browser_type.launch(**launch_kwargs, channel="chrome", args=args_incog)
-                except Exception:
-                    chrome_exe = find_chrome_executable()
-                    if chrome_exe:
-                        try:
-                            browser = browser_type.launch(**launch_kwargs, executable_path=chrome_exe, args=args_incog)
-                        except Exception:
-                            try:
-                                # Edge InPrivate como último recurso visible en Windows
-                                browser = browser_type.launch(**launch_kwargs, channel="msedge", args=["--inprivate", "--new-window"])
-                            except Exception:
-                                browser = browser_type.launch(**launch_kwargs, args=["--incognito"])
-                    else:
-                        try:
-                            browser = browser_type.launch(**launch_kwargs, channel="msedge", args=["--inprivate", "--new-window"])
-                        except Exception:
-                            browser = browser_type.launch(**launch_kwargs, args=["--incognito"])
-            else:
-                browser = browser_type.launch(**launch_kwargs)
+            browser = browser_type.launch(**launch_kwargs)
             context = browser.new_context(**context_opts)
             return browser, context
 
@@ -250,7 +281,29 @@ def visit_links_with_rotation(
             video_playing = False
 
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                if simulate_referrer_search and ("youtube.com" in url or "youtu.be" in url):
+                    try:
+                        page.goto("https://www.google.com/", wait_until="domcontentloaded", timeout=25000)
+                        page.wait_for_timeout(random.randint(300, 800))
+                        parsed = urllib.parse.urlparse(url)
+                        qs = urllib.parse.parse_qs(parsed.query)
+                        vid = qs.get("v", [""])[0]
+                        query = f"site:youtube.com {vid}" if vid else f"site:youtube.com {parsed.path.strip('/')}"
+                        try:
+                            page.fill('input[name="q"]', query)
+                            page.keyboard.press("Enter")
+                        except Exception:
+                            page.goto(url, referer="https://www.google.com/", wait_until="domcontentloaded", timeout=30000)
+                        page.wait_for_load_state("domcontentloaded")
+                        generate_human_mouse_movement(page, steps=random.randint(5, 9))
+                        try:
+                            page.locator('a[href*="youtube.com"]').first.click(timeout=8000)
+                        except Exception:
+                            page.goto(url, referer="https://www.google.com/", wait_until="domcontentloaded", timeout=30000)
+                    except Exception:
+                        page.goto(url, referer="https://www.google.com/", wait_until="domcontentloaded", timeout=30000)
+                else:
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
                 # Ejecuta acciones si fueron provistas
                 if actions:
@@ -360,12 +413,12 @@ def visit_links_with_rotation(
                                 sel = act.get("selector")
                                 if sel:
                                     page.evaluate(
-                                        "selector => { const v = document.querySelector(selector); if (v && v.play) v.play(); }",
+                                        "selector => { const v = document.querySelector(selector); if (v) { try { v.muted = false; v.volume = 0.7; } catch(e){} if (v.play) v.play(); } }",
                                         sel,
                                     )
                                 else:
                                     page.evaluate(
-                                        "() => { const v = document.querySelector('video'); if (v && v.play) v.play(); }"
+                                        "() => { const v = document.querySelector('video'); if (v) { try { v.muted = false; v.volume = 0.7; } catch(e){} if (v.play) v.play(); } }"
                                     )
                         except Exception:
                             # Ignora errores de acción individuales para no detener toda la visita
@@ -563,27 +616,33 @@ def visit_links_with_rotation(
                                         sel = act.get("selector")
                                         if sel:
                                             page.evaluate(
-                                                "selector => { const v = document.querySelector(selector); if (v && v.play) v.play(); }",
+                                                "selector => { const v = document.querySelector(selector); if (v) { try { v.muted = false; v.volume = 0.7; } catch(e){} if (v.play) v.play(); } }",
                                                 sel,
                                             )
                                         else:
                                             page.evaluate(
-                                                "() => { const v = document.querySelector('video'); if (v && v.play) v.play(); }"
+                                                "() => { const v = document.querySelector('video'); if (v) { try { v.muted = false; v.volume = 0.7; } catch(e){} if (v.play) v.play(); } }"
                                             )
                                 except Exception:
                                     pass
 
-                        # Recalcular estado de reproducción en fallback
-                        try:
-                            status_info = page.evaluate(
-                                "() => { const v = document.querySelector('video'); return { hasVideo: !!v, isPlaying: !!(v && !v.paused && v.currentTime > 0), readyState: v ? v.readyState : null }; }"
-                            )
-                            video_playing = bool(status_info.get("isPlaying")) if isinstance(status_info, dict) else False
-                        except Exception:
-                            video_playing = False
+                    except Exception:
+                        pass
+                    if True:
+                        # Comprobación simplificada de reproducción de video en YouTube
+                        status_info = page.evaluate(
+                            "() => { try { const v = document.querySelector('video'); const isPlaying = !!(v && !v.paused && v.currentTime > 0); return { hasVideo: !!v, isPlaying, readyState: v ? v.readyState : null }; } catch(e){ return { hasVideo: false, isPlaying: false, readyState: null }; } }"
+                        )
+                        video_playing = bool(status_info.get("isPlaying")) if isinstance(status_info, dict) else False
+                        if ("youtube.com" in url or "youtu.be" in url) and not video_playing:
+                            page.keyboard.press("k")
+                            page.evaluate("() => { try { const v = document.querySelector('video'); if (v && v.play) v.play(); } catch(e){} }")
 
-                        page.wait_for_timeout(random.randint(500, 1500))
-                        page.mouse.wheel(0, random.randint(800, 2400))
+                        generate_human_mouse_movement(page, steps=random.randint(5, 10))
+                        for _ in range(random.randint(1, 3)):
+                            page.mouse.wheel(0, random.randint(600, 2000))
+                            page.wait_for_timeout(random.randint(300, 900))
+
                         dwell = random.randint(min_dwell_ms, max_dwell_ms)
                         page.wait_for_timeout(dwell)
 
@@ -593,14 +652,6 @@ def visit_links_with_rotation(
 
                         status = "ok"
                         error = None
-                    except Exception as e2:
-                        status = "error"
-                        error = f"proxy_failed_and_fallback_error: {e2} | original: {error}"
-            finally:
-                try:
-                    page.close()
-                except Exception:
-                    pass
 
             pages_on_current_proxy += 1
             results.append({
@@ -612,7 +663,10 @@ def visit_links_with_rotation(
                 "elapsed_ms": int((time.time() - started) * 1000),
                 "min_dwell_ms": min_dwell_ms,
                 "max_dwell_ms": max_dwell_ms,
-                "device_profile": (android_profiles[profile_index % len(android_profiles)]["name"] if rotate_android_profiles and android_profiles else None),
+                "device_profile": (
+                    android_profiles[profile_index % len(android_profiles)]["name"]
+                    if rotate_android_profiles and android_profiles else current_profile_name
+                ),
                 "vpn_provider": vpn_provider if vpn is not None else None,
                 "vpn_country": vpn_country if vpn is not None else None,
                 "video_playing": video_playing,
